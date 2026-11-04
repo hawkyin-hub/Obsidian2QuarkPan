@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, type TFile } from "obsidian";
 import { QuarkClient } from "./quark.ts";
 import { obsidianFetchFn } from "./obsidian-fetch.ts";
 import { sha256Hex } from "./hash.ts";
@@ -16,6 +16,7 @@ import {
 interface PluginData {
   settings: QuarkSyncSettings;
   lastState: LastSynced[];
+  tombstones?: { localDeleted: string[]; remoteDeleted: string[] };
   lastSyncAt?: string;
   lastProgress?: { total: number; done: number; failed: number; interrupted: boolean; active: boolean; paused?: boolean };
 }
@@ -23,6 +24,7 @@ interface PluginData {
 export default class QuarkSyncPlugin extends Plugin {
   settings: QuarkSyncSettings = DEFAULT_SETTINGS;
   lastState: LastSynced[] = [];
+  tombstones: { localDeleted: string[]; remoteDeleted: string[] } = { localDeleted: [], remoteDeleted: [] };
   private lastSyncAt: string | null = null;
   private log = new RingLog(200);
   private running = false;
@@ -34,6 +36,7 @@ export default class QuarkSyncPlugin extends Plugin {
     if (data) {
       this.settings = { ...DEFAULT_SETTINGS, ...(data.settings ?? {}) };
       this.lastState = data.lastState ?? [];
+      this.tombstones = data.tombstones ?? { localDeleted: [], remoteDeleted: [] };
       this.lastSyncAt = typeof data.lastSyncAt === "string" ? data.lastSyncAt : null;
       if (data.lastProgress) {
         // A run saved mid-sync (active) never finished: on reload it
@@ -109,6 +112,7 @@ export default class QuarkSyncPlugin extends Plugin {
     await this.saveData({
       settings: this.settings,
       lastState: this.lastState,
+      tombstones: this.tombstones,
       lastSyncAt: this.lastSyncAt,
       lastProgress: {
         total: this.progress.total,
@@ -240,7 +244,7 @@ export default class QuarkSyncPlugin extends Plugin {
     }
     this.cancelRequested = false;
     if (!this.settings.cookie.trim()) {
-      if (!quiet) new Notice("请先在设置页粘贴夸克 Cookie 或用二维码登录");
+      if (!quiet) new Notice("请先在设置页粘贴夸克 Cookie");
       return;
     }
     this.running = true;
@@ -364,13 +368,38 @@ export default class QuarkSyncPlugin extends Plugin {
       this.progressBase = 0;
       this.progressFileDone = 0;
       this.notifyProgress();
-      const { summary, newState, cancelled } = await runSync(
+      const { summary, newState, tombstones: newTombstones, cancelled } = await runSync(
         client,
         localFiles,
         this.lastState,
         {
           targetSegments: targetSegments(this.settings),
           mirrorDelete: this.settings.mirrorDelete,
+          twoWay: this.settings.twoWay,
+          tombstones: this.tombstones,
+          extraIgnores,
+          writeLocal: async (path, data) => {
+            const dir = dirOf(path);
+            if (dir) {
+              const parts = dir.split("/");
+              let cur = "";
+              for (const seg of parts) {
+                cur = cur ? `${cur}/${seg}` : seg;
+                if (!this.app.vault.getAbstractFileByPath(cur)) await this.app.vault.createFolder(cur);
+              }
+            }
+            const buf = data.slice().buffer as ArrayBuffer;
+            const existing = this.app.vault.getAbstractFileByPath(path);
+            if (existing && "stat" in existing) {
+              await this.app.vault.modifyBinary(existing as TFile, buf);
+            } else {
+              await this.app.vault.createBinary(path, buf);
+            }
+          },
+          deleteLocal: async (path) => {
+            const f = this.app.vault.getAbstractFileByPath(path);
+            if (f) await this.app.vault.trash(f, false);
+          },
           maxFileBytes: this.settings.maxFileBytes,
           shouldCancel: () => this.cancelRequested,
           onUploadPart: (path, part, totalParts) => {
@@ -383,7 +412,7 @@ export default class QuarkSyncPlugin extends Plugin {
         async (done, total, current, kind) => {
           this.progressCurrent = current;
           this.setStatus(`夸克同步：${done}/${total} · ${current}`);
-          if (kind !== "deleteRemote") {
+          if (kind !== "deleteRemote" && kind !== "deleteLocal") {
             this.progressFileDone++;
             this.progress.done = Math.min(this.progress.total, this.progressBase + this.progressFileDone);
             this.notifyProgressThrottled();
@@ -405,6 +434,7 @@ export default class QuarkSyncPlugin extends Plugin {
       this.progress.failed = summary.failed.length;
       this.lastSyncAt = new Date().toISOString();
       this.lastState = newState;
+      this.tombstones = newTombstones;
       this.syncCookieFrom(client);
       if (cancelled) {
         this.progress.paused = true;
@@ -418,11 +448,12 @@ export default class QuarkSyncPlugin extends Plugin {
         this.notifyProgress();
         await this.saveSettings();
         this.statusEl?.setText(
-          `夸克同步完成：上传 ${summary.uploaded + summary.reuploaded} · 跳过 ${summary.skipped} · 失败 ${summary.failed.length}`,
+          `夸克同步完成：上传 ${summary.uploaded + summary.reuploaded} · 下载 ${summary.downloaded} · 跳过 ${summary.skipped} · 失败 ${summary.failed.length}`,
         );
         const msg =
           `夸克同步完成：上传 ${summary.uploaded}、重新上传 ${summary.reuploaded}、` +
-          `改名 ${summary.renamed}、移动 ${summary.moved}、远端删除 ${summary.deletedRemote}、` +
+          `下载 ${summary.downloaded}、冲突另存 ${summary.conflictCopies}、` +
+          `改名 ${summary.renamed}、移动 ${summary.moved}、远端删除 ${summary.deletedRemote}、本地删除 ${summary.deletedLocal}、` +
           `跳过 ${summary.skipped}` +
           (summary.adopted > 0 ? `、认领 ${summary.adopted}` : "") +
           `、失败 ${summary.failed.length}` +

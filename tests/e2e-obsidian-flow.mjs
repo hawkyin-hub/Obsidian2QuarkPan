@@ -49,7 +49,7 @@ function makeServer(opts = {}) {
   const nextFid = () => String(fidSeq++);
   const children = (parent) => [
     ...[...folders.values()].filter((f) => f.parent === parent).map((f) => ({ fid: f.fid, file_name: f.name, file_type: 0, size: 0 })),
-    ...[...files.values()].filter((f) => f.parent === parent).map((f) => ({ fid: f.fid, file_name: f.name, file_type: 1, size: f.bytes.length })),
+    ...[...files.values()].filter((f) => f.parent === parent).map((f) => ({ fid: f.fid, file_name: f.name, file_type: 1, size: f.bytes.length, updated_at: f.updated_at ?? 1700000000000 })),
   ];
   return {
     state: { folders, files, get preCount() { return preCount; }, get jarSession() { return jarSession; } },
@@ -106,7 +106,10 @@ function makeServer(opts = {}) {
         }
         if (p === "file/rename") return json({ status: 200, code: 0, data: {} });
         if (p === "file/move") return json({ status: 200, code: 0, data: { finish: true } });
-        if (p === "file/download") return json({ status: 200, code: 0, data: [{ download_url: "https://mock-download/file", file_name: "x", size: 1 }] });
+        if (p === "file/download") {
+          const fid = (body.fids ?? [])[0];
+          return json({ status: 200, code: 0, data: [{ download_url: `https://mock-download/file/${fid}`, file_name: "x", size: 1 }] });
+        }
         if (p === "file/upload/pre") {
           preCount++;
           const taskId = `task-${nextFid()}`;
@@ -120,14 +123,18 @@ function makeServer(opts = {}) {
           if (task) {
             const parts = [...task.chunks.entries()].sort((a, b) => a[0] - b[0]).map(([, b]) => b);
             const fid = nextFid();
-            files.set(fid, { fid, name: task.file_name, parent: task.pdir_fid, type: 1, bytes: Buffer.concat(parts) });
+            files.set(fid, { fid, name: task.file_name, parent: task.pdir_fid, type: 1, bytes: Buffer.concat(parts), updated_at: Date.now() });
           }
           return json({ status: 200, code: 0, data: {} });
         }
         if (p === "task") return json({ status: 200, code: 0, data: { status: 2 } });
         throw new Error(`unmocked drive-pc route ${method} ${p}`);
       }
-      if (host === "mock-download") return { ok: true, status: 200, data: Buffer.from("x") };
+      if (host === "mock-download") {
+        const fid = u.pathname.split("/").pop();
+        const f = files.get(fid);
+        return { ok: true, status: 200, data: f ? f.bytes : Buffer.from("x") };
+      }
       throw new Error(`unmocked host ${host} ${u.pathname}`);
     },
   };
@@ -213,6 +220,44 @@ function makeVault() {
     },
   };
 }
+// Mutable in-memory vault for the bidirectional section: supports the
+// writes a download needs (createBinary/modifyBinary/createFolder/trash).
+function makeMutableVault(initial = []) {
+  const files = new Map();
+  const folders = new Set();
+  for (const f of initial) files.set(f.path, { path: f.path, content: Buffer.from(f.content, "utf8"), mtime: f.mtime ?? 1700000000000 });
+  const vault = {
+    getFiles: () => [...files.values()].map((f) => ({ path: f.path, stat: { mtime: f.mtime } })),
+    readBinary: async (file) => {
+      const rec = files.get(file.path);
+      return rec.content.buffer.slice(rec.content.byteOffset, rec.content.byteOffset + rec.content.byteLength);
+    },
+    createBinary: async (path, data) => {
+      const content = Buffer.from(data);
+      files.set(path, { path, content, mtime: Date.now() });
+      return { path, stat: { mtime: Date.now() } };
+    },
+    modifyBinary: async (file, data) => {
+      const rec = files.get(file.path);
+      rec.content = Buffer.from(data);
+      rec.mtime = Date.now();
+    },
+    createFolder: async (path) => { folders.add(path); return { path }; },
+    getAbstractFileByPath: (path) => {
+      if (files.has(path)) { const f = files.get(path); return { path, stat: { mtime: f.mtime } }; }
+      if (folders.has(path)) return { path };
+      return null;
+    },
+    rename: async (file, newPath) => {
+      const rec = files.get(file.path);
+      files.delete(file.path);
+      rec.path = newPath;
+      files.set(newPath, rec);
+    },
+    trash: async (file) => { files.delete(file.path); },
+  };
+  return { vault, files, folders };
+}
 function setupEnv(server) {
   // Browser fetch is CORS-blocked for quark.cn in Obsidian: make it throw,
   // so any plugin path still using fetch fails loudly instead of silently.
@@ -244,10 +289,10 @@ console.log("\n== mode: Obsidian requestUrl (browser fetch throws) ==");
   assert(mark, "superscript ! marker exists on the version row");
   mark.onclick();
   assert(verRow.descEl.style.display !== "none", "clicking ! shows the version note");
-  assert(String(verRow.desc).includes("只覆盖 main.js") && String(verRow.desc).includes("本地为准"), "expanded note holds the update note and the one-way orientation");
+  assert(String(verRow.desc).includes("只覆盖 main.js") && String(verRow.desc).includes("双向同步"), "expanded note holds the update note and the two-way orientation");
   mark.onclick();
   assert(verRow.descEl.style.display === "none", "clicking ! again hides the version note");
-  assert(!globalThis.__settingTab.containerEl.children.some((c) => c.tag === "p" && String(c.text ?? "").includes("本地为准")), "no standalone orientation paragraph anymore (it moved behind !)");
+  assert(!globalThis.__settingTab.containerEl.children.some((c) => c.tag === "p" && String(c.text ?? "").includes("双向同步")), "no standalone orientation paragraph anymore (it moved behind !)");
 
   // QR login is removed (2026-11-03) and its transition notes are gone for
   // release (v0.1.21): no QR button, no cancelled-QR row, no jar warning.
@@ -642,6 +687,83 @@ console.log("\n== connection gate (requestUrl down) ==");
   assert(lastNotice().includes("失败 0"), `sync succeeds once connection is back (got: ${lastNotice()})`);
   globalThis.__settingTab.hide();
   console.log("== connection gate: PASSED ==");
+}
+
+
+// ---------------- Bidirectional sync (v0.2.0) ----------------
+console.log("\n== bidirectional sync ==");
+{
+  const server = makeServer();
+  setupEnv(server);
+  globalThis.__store = null;
+  globalThis.__notices = [];
+  const manifest = { id: "obsidian-quark-sync", name: "Quark Sync", version: JSON.parse(readFileSync(path.join(root, "manifest.json"), "utf8")).version };
+  // Pre-seed the default target folder so remote files can be seeded before sync.
+  server.state.folders.set("900", { fid: "900", name: "Obsidian备份", parent: "0", type: 0 });
+  server.state.folders.set("901", { fid: "901", name: "子目录", parent: "900", type: 0 });
+  const { vault, files, folders } = makeMutableVault([{ path: "本地.md", content: "local v1" }]);
+  let plugin = await loadPlugin({ vault }, manifest);
+  plugin.settings.cookie = "__puus=pasted-session; other=x";
+  await plugin.saveSettings();
+  const syncOk = async () => {
+    globalThis.__notices = [];
+    await plugin.syncNow();
+    assert(lastNotice().includes("失败 0"), `sync completes with 0 failures (got: ${lastNotice()})`);
+  };
+  const serverFile = (name, parent = "900") => [...server.state.files.values()].find((f) => f.name === name && f.parent === parent);
+
+  // Phase 1: remote-only files (incl. a nested one) download into the vault.
+  server.state.files.set("2001", { fid: "2001", name: "远端新增.md", parent: "900", type: 1, bytes: Buffer.from("remote new", "utf8"), updated_at: 1700000001000 });
+  server.state.files.set("2002", { fid: "2002", name: "嵌套.md", parent: "901", type: 1, bytes: Buffer.from("nested", "utf8"), updated_at: 1700000001000 });
+  await syncOk();
+  assert(files.has("远端新增.md") && files.get("远端新增.md").content.toString() === "remote new", "remote-only file downloaded to vault");
+  assert(files.has("子目录/嵌套.md") && files.get("子目录/嵌套.md").content.toString() === "nested", "nested remote file downloaded with parent folder created");
+  assert(folders.has("子目录"), "parent folder created for nested download");
+  assert(serverFile("本地.md"), "local file uploaded in the same run");
+
+  // Phase 2: remote changed, local unchanged -> download overwrites local.
+  const lf = serverFile("本地.md");
+  lf.bytes = Buffer.from("remote v2", "utf8");
+  lf.updated_at = 1700000002000;
+  await syncOk();
+  assert(files.get("本地.md").content.toString() === "remote v2", "remote change overwrote unchanged local file");
+
+  // Phase 3: both changed -> conflict copy, original untouched, remote untouched.
+  files.get("本地.md").content = Buffer.from("local v3", "utf8");
+  lf.bytes = Buffer.from("remote v3", "utf8");
+  lf.updated_at = 1700000003000;
+  await syncOk();
+  assert(files.get("本地.md").content.toString() === "local v3", "conflict keeps local original untouched");
+  assert(files.has("本地（夸克冲突）.md") && files.get("本地（夸克冲突）.md").content.toString() === "remote v3", "conflict saves remote version as a separate file");
+  assert(lf.bytes.toString() === "remote v3", "conflict does not overwrite remote");
+
+  // Phase 4: local delete, mirror off -> kept remotely, never resurrected (even after restart).
+  files.delete("本地.md");
+  await syncOk();
+  assert(serverFile("本地.md"), "locally deleted file stays on remote with mirror off");
+  assert(!files.has("本地.md"), "locally deleted file stays deleted after sync");
+  plugin = await loadPlugin({ vault }, manifest);
+  await syncOk();
+  assert(!files.has("本地.md"), "tombstone survives restart: no resurrection on the next sync");
+  assert((globalThis.__store?.tombstones?.localDeleted ?? []).includes("本地.md"), "local-deletion tombstone persisted");
+
+  // Phase 5: remote delete, mirror off -> kept locally, never re-uploaded.
+  server.state.files.delete(serverFile("远端新增.md").fid);
+  await syncOk();
+  assert(files.has("远端新增.md"), "remotely deleted file stays local with mirror off");
+  await syncOk();
+  assert(!serverFile("远端新增.md"), "remotely deleted file is not re-uploaded on the next sync");
+  assert((globalThis.__store?.tombstones?.remoteDeleted ?? []).includes("远端新增.md"), "remote-deletion tombstone persisted");
+
+  // Phase 6: mirror on -> deletions propagate both ways.
+  plugin.settings.mirrorDelete = true;
+  await plugin.saveSettings();
+  server.state.files.delete(serverFile("本地（夸克冲突）.md").fid);
+  await syncOk();
+  assert(!files.has("本地（夸克冲突）.md"), "mirror on: remote deletion trashes the local file");
+  assert(!files.has("远端新增.md"), "mirror on: remote deletion trashes the other local file too");
+  assert(!serverFile("本地.md"), "mirror on: local deletion deletes the remote file");
+  console.log("== bidirectional sync: PASSED ==");
 }
 
 console.log("\nE2E OBSIDIAN FLOW: ALL PASSED");

@@ -4,12 +4,19 @@
 // so it runs identically in Obsidian and in tests.
 
 import { QuarkClient } from "./quark.ts";
-import { computeDiff, type LastSynced, type LocalFile } from "./diff.ts";
+import { computeDiff, type LastSynced, type LocalFile, type Tombstones } from "./diff.ts";
+import { sha256Hex } from "./hash.ts";
+import { isIgnored } from "./ignore.ts";
 import type { RingLog } from "./log.ts";
 
 export interface SyncOptions {
   targetSegments: string[];
   mirrorDelete: boolean;
+  twoWay: boolean;
+  tombstones: Tombstones;
+  extraIgnores?: string[];
+  writeLocal?: (path: string, data: Uint8Array) => Promise<void>;
+  deleteLocal?: (path: string) => Promise<void>;
   maxFileBytes: number;
   shouldCancel?: () => boolean;
   onUploadPart?: (path: string, part: number, totalParts: number) => void;
@@ -21,6 +28,9 @@ export interface SyncSummary {
   renamed: number;
   moved: number;
   deletedRemote: number;
+  deletedLocal: number;
+  downloaded: number;
+  conflictCopies: number;
   skipped: number;
   adopted: number;
   failed: Array<{ path: string; error: string }>;
@@ -62,13 +72,16 @@ export async function runSync(
   log: RingLog,
   onProgress?: (done: number, total: number, current: string, kind?: string) => void | Promise<void>,
   onDiffed?: (info: { skipped: number; filtered: number; adopted: number }) => void | Promise<void>,
-): Promise<{ summary: SyncSummary; newState: LastSynced[]; cancelled: boolean }> {
+): Promise<{ summary: SyncSummary; newState: LastSynced[]; tombstones: Tombstones; cancelled: boolean }> {
   const summary: SyncSummary = {
     uploaded: 0,
     reuploaded: 0,
     renamed: 0,
     moved: 0,
     deletedRemote: 0,
+    deletedLocal: 0,
+    downloaded: 0,
+    conflictCopies: 0,
     skipped: 0,
     adopted: 0,
     failed: [],
@@ -94,7 +107,11 @@ export async function runSync(
   const targetFid = await client.ensureFolderPath(options.targetSegments, "0");
   log.info(`目标文件夹 fid 已解析，路径：${options.targetSegments.join("/") || "(根)"}`);
   const remote = await client.listRecursive(targetFid);
-  const { plan, skipped, notes, adopted } = computeDiff(usable, remote, lastState, options.mirrorDelete);
+  const { plan, skipped, notes, adopted, refreshed, dropState, tombstones: newTombstones } = computeDiff(usable, remote, lastState, {
+    mirrorDelete: options.mirrorDelete,
+    twoWay: options.twoWay,
+    tombstones: options.tombstones,
+  });
   await onDiffed?.({ skipped: skipped.length, filtered: localFiles.length - usable.length, adopted: adopted.length });
   summary.skipped = skipped.length;
   summary.adopted = adopted.length;
@@ -104,6 +121,8 @@ export async function runSync(
   const localByPath = new Map(usable.map((f) => [f.path, f]));
   const newStateByPath = new Map(lastState.map((s) => [s.path, s]));
   for (const a of adopted) newStateByPath.set(a.path, a);
+  for (const r of refreshed) newStateByPath.set(r.path, r);
+  for (const d of dropState) newStateByPath.delete(d);
   for (const p of skipped) {
     // Keep the old state entry as-is.
     void p;
@@ -135,7 +154,8 @@ export async function runSync(
 
   // Execute renames/moves first, then uploads, then remote deletes.
   const ordered = [...plan].sort((a, b) => {
-    const rank = (k: string) => (k === "rename" || k === "move" ? 0 : k === "upload" || k === "reupload" ? 1 : 2);
+    const rank = (k: string) =>
+      k === "rename" || k === "move" ? 0 : k === "upload" || k === "reupload" || k === "download" || k === "downloadConflict" ? 1 : 2;
     return rank(a.kind) - rank(b.kind);
   });
 
@@ -203,12 +223,93 @@ export async function runSync(
         else summary.reuploaded++;
         log.info(`${action.kind === "upload" ? "上传成功" : "重新上传成功"}：${action.path} size=${f.size}`);
         await onProgress?.(done, total, action.path, action.kind);
+      } else if (action.kind === "download" || action.kind === "downloadConflict") {
+        const isConflict = action.kind === "downloadConflict";
+        if (isIgnored(action.path, options.extraIgnores ?? [])) {
+          log.warn(`远端文件命中忽略规则，未下载：${action.path}`);
+          summary.notes.push(`远端文件命中忽略规则，未下载：${action.path}`);
+          await onProgress?.(done, total, action.path, action.kind);
+          continue;
+        }
+        if (action.size > options.maxFileBytes) {
+          log.warn(`跳过超限远端文件（>${options.maxFileBytes} 字节）：${action.path} size=${action.size}`);
+          summary.notes.push(`跳过超限远端文件：${action.path}`);
+          await onProgress?.(done, total, action.path, action.kind);
+          continue;
+        }
+        if (!options.writeLocal) throw new Error(`未提供本地写入回调，无法下载：${action.path}`);
+        const bytes = await client.downloadBytes(action.fid);
+        const sha = await sha256Hex(bytes);
+        if (isConflict) {
+          const f = localByPath.get(action.path)!;
+          if (sha === f.sha256) {
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: f.size,
+              mtimeMs: f.mtimeMs,
+              sha256: f.sha256,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...(action.updatedAt !== undefined ? { remoteUpdatedAt: action.updatedAt } : {}),
+            });
+            log.info(`冲突已自行一致，无需另存：${action.path}`);
+          } else {
+            await options.writeLocal(action.conflictPath, bytes);
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: f.size,
+              mtimeMs: f.mtimeMs,
+              sha256: f.sha256,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...(action.updatedAt !== undefined ? { remoteUpdatedAt: action.updatedAt } : {}),
+            });
+            summary.conflictCopies++;
+            log.info(`冲突：远端版已另存为 ${action.conflictPath}，本地原文件未动：${action.path}`);
+          }
+          await onProgress?.(done, total, action.path, action.kind);
+        } else {
+          const existing = localByPath.get(action.path);
+          if (existing && existing.sha256 === sha) {
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: existing.size,
+              mtimeMs: existing.mtimeMs,
+              sha256: existing.sha256,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...(action.updatedAt !== undefined ? { remoteUpdatedAt: action.updatedAt } : {}),
+            });
+            log.info(`远端内容与本地一致，无需写入：${action.path}`);
+          } else {
+            await options.writeLocal(action.path, bytes);
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: bytes.length,
+              mtimeMs: Date.now(),
+              sha256: sha,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...(action.updatedAt !== undefined ? { remoteUpdatedAt: action.updatedAt } : {}),
+            });
+            summary.downloaded++;
+            log.info(`下载成功：${action.path} size=${bytes.length}`);
+          }
+          await onProgress?.(done, total, action.path, action.kind);
+        }
       } else if (action.kind === "deleteRemote") {
         await client.deleteFiles([action.fid]);
         newStateByPath.delete(action.path);
         summary.deletedRemote++;
         log.info(`删除远端：${action.path}`);
         await onProgress?.(done, total, action.path, "deleteRemote");
+      } else if (action.kind === "deleteLocal") {
+        if (!options.deleteLocal) throw new Error(`未提供本地删除回调，无法删除本地文件：${action.path}`);
+        await options.deleteLocal(action.path);
+        newStateByPath.delete(action.path);
+        summary.deletedLocal++;
+        log.info(`删除本地：${action.path}`);
+        await onProgress?.(done, total, action.path, "deleteLocal");
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -219,5 +320,5 @@ export async function runSync(
     }
   }
 
-  return { summary, newState: [...newStateByPath.values()], cancelled };
+  return { summary, newState: [...newStateByPath.values()], tombstones: newTombstones, cancelled };
 }

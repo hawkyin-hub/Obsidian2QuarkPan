@@ -465,7 +465,7 @@ var QuarkClient = class {
         if (it.file_type === 0) {
           queue.push({ fid: it.fid, prefix: path });
         } else {
-          out.push({ path, fid: it.fid, size: it.size });
+          out.push({ path, fid: it.fid, size: it.size, updatedAt: it.updated_at });
         }
       }
     }
@@ -884,14 +884,60 @@ function basename(p) {
   const i = p.lastIndexOf("/");
   return i === -1 ? p : p.slice(i + 1);
 }
-function computeDiff(local, remote, last, mirrorDelete) {
+function normalizeOpts(o) {
+  if (typeof o === "boolean") {
+    return { mirrorDelete: o, twoWay: false, tombstones: { localDeleted: [], remoteDeleted: [] } };
+  }
+  return {
+    mirrorDelete: o.mirrorDelete,
+    twoWay: o.twoWay,
+    tombstones: o.tombstones ?? { localDeleted: [], remoteDeleted: [] }
+  };
+}
+function localChanged(f, s) {
+  return !s || s.size !== f.size || s.sha256 !== f.sha256;
+}
+function remoteChanged(r, s) {
+  if (!s) return false;
+  if (s.remoteSize !== void 0) {
+    if (r.size !== s.remoteSize) return true;
+    if (r.updatedAt !== void 0 && s.remoteUpdatedAt !== void 0 && r.updatedAt !== s.remoteUpdatedAt) return true;
+    return false;
+  }
+  return r.size !== s.size;
+}
+function conflictPathFor(path, localPaths, remotePaths) {
+  const dir = dirname(path);
+  const base = basename(path);
+  const dot = base.lastIndexOf(".");
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : "";
+  const make = (suffix) => dir ? `${dir}/${stem}${suffix}${ext}` : `${stem}${suffix}${ext}`;
+  let cand = make("\uFF08\u5938\u514B\u51B2\u7A81\uFF09");
+  let n = 2;
+  while (localPaths.has(cand) || remotePaths.has(cand)) {
+    cand = make(`\uFF08\u5938\u514B\u51B2\u7A81 ${n}\uFF09`);
+    n++;
+  }
+  return cand;
+}
+function computeDiff(local, remote, last, inputOpts) {
+  const opts = normalizeOpts(inputOpts);
   const plan = [];
   const skipped = [];
   const notes = [];
   const adopted = [];
+  const refreshed = [];
+  const dropState = [];
   const localByPath = new Map(local.map((f) => [f.path, f]));
   const remoteByPath = new Map(remote.map((f) => [f.path, f]));
   const lastByPath = new Map(last.map((f) => [f.path, f]));
+  const localPaths = new Set(local.map((f) => f.path));
+  const remotePaths = new Set(remote.map((f) => f.path));
+  const localDel = new Set(opts.tombstones.localDeleted);
+  const remoteDel = new Set(opts.tombstones.remoteDeleted);
+  for (const p of localPaths) localDel.delete(p);
+  for (const p of remotePaths) remoteDel.delete(p);
   const goneRemote = [];
   for (const r of remote) {
     if (!localByPath.has(r.path) && lastByPath.has(r.path)) {
@@ -908,6 +954,20 @@ function computeDiff(local, remote, last, mirrorDelete) {
     const r = remoteByPath.get(f.path);
     const s = lastByPath.get(f.path);
     if (!r) {
+      if (s) {
+        if (opts.mirrorDelete && opts.twoWay) {
+          plan.push({ kind: "deleteLocal", path: f.path });
+          continue;
+        }
+        if (opts.twoWay) {
+          remoteDel.add(f.path);
+          notes.push(`\u8FDC\u7AEF\u5DF2\u5220\uFF0C\u672C\u5730\u4FDD\u7559\uFF0C\u4E0D\u4E0A\u4F20\uFF1A${f.path}`);
+          continue;
+        }
+      } else if (opts.twoWay && remoteDel.has(f.path)) {
+        notes.push(`\u8FDC\u7AEF\u5DF2\u5220\uFF0C\u672C\u5730\u4FDD\u7559\uFF0C\u4E0D\u4E0A\u4F20\uFF1A${f.path}`);
+        continue;
+      }
       const match = goneByContent.get(`${f.size}:${f.sha256}`);
       if (match && !consumedGone.has(match.path)) {
         consumedGone.add(match.path);
@@ -924,18 +984,81 @@ function computeDiff(local, remote, last, mirrorDelete) {
       }
       continue;
     }
-    if (s && s.size === f.size && s.sha256 === f.sha256) {
+    const lc = localChanged(f, s);
+    const rc = remoteChanged(r, s);
+    if (!lc && !rc) {
       skipped.push(f.path);
-      continue;
-    }
-    if (!s && r.size === f.size) {
-      adopted.push({ path: f.path, size: f.size, mtimeMs: f.mtimeMs, sha256: f.sha256, fid: r.fid });
-      notes.push(`\u8FDC\u7AEF\u5DF2\u6709\u540C\u540D\u540C\u5927\u5C0F\u6587\u4EF6\uFF0C\u5DF2\u6807\u8BB0\u4E3A\u5DF2\u4E0A\u4F20\uFF08\u672A\u91CD\u65B0\u4E0A\u4F20\uFF09\uFF1A${f.path}`);
+      if (s) {
+        refreshed.push({
+          ...s,
+          remoteSize: r.size,
+          ...r.updatedAt !== void 0 ? { remoteUpdatedAt: r.updatedAt } : {}
+        });
+      }
       continue;
     }
     if (!s) {
+      if (r.size === f.size) {
+        adopted.push({
+          path: f.path,
+          size: f.size,
+          mtimeMs: f.mtimeMs,
+          sha256: f.sha256,
+          fid: r.fid,
+          remoteSize: r.size,
+          ...r.updatedAt !== void 0 ? { remoteUpdatedAt: r.updatedAt } : {},
+          adopted: true
+        });
+        notes.push(`\u8FDC\u7AEF\u5DF2\u6709\u540C\u540D\u540C\u5927\u5C0F\u6587\u4EF6\uFF0C\u5DF2\u6807\u8BB0\u4E3A\u5DF2\u4E0A\u4F20\uFF08\u672A\u91CD\u65B0\u4E0A\u4F20\uFF09\uFF1A${f.path}`);
+        continue;
+      }
       notes.push(`\u8FDC\u7AEF\u540C\u540D\u6587\u4EF6\u5927\u5C0F\u4E0D\u540C\uFF0C\u5DF2\u6309\u672C\u5730\u91CD\u65B0\u4E0A\u4F20\uFF1A${f.path}`);
-    } else if (s.size !== r.size) {
+      plan.push({ kind: "reupload", path: f.path, oldFid: r.fid });
+      continue;
+    }
+    if (lc && !rc) {
+      plan.push({ kind: "reupload", path: f.path, oldFid: r.fid });
+      continue;
+    }
+    if (!lc && rc) {
+      if (s.adopted) {
+        plan.push({
+          kind: "downloadConflict",
+          path: f.path,
+          fid: r.fid,
+          size: r.size,
+          updatedAt: r.updatedAt,
+          conflictPath: conflictPathFor(f.path, localPaths, remotePaths)
+        });
+        notes.push(`\u51B2\u7A81\uFF08\u8BA4\u9886\u6587\u4EF6\u8FDC\u7AEF\u6709\u53D8\uFF0C\u8FDC\u7AEF\u7248\u53E6\u5B58\uFF0C\u4E0D\u8986\u76D6\u672C\u5730\uFF09\uFF1A${f.path}`);
+        continue;
+      }
+      if (opts.twoWay) {
+        plan.push({ kind: "download", path: f.path, fid: r.fid, size: r.size, updatedAt: r.updatedAt });
+        continue;
+      }
+      skipped.push(f.path);
+      refreshed.push({
+        ...s,
+        remoteSize: r.size,
+        ...r.updatedAt !== void 0 ? { remoteUpdatedAt: r.updatedAt } : {}
+      });
+      notes.push(`\u8FDC\u7AEF\u6709\u6539\u52A8\u4F46\u672C\u5730\u672A\u53D8\uFF0C\u5355\u5411\u6A21\u5F0F\u4E0D\u4E0B\u8F7D\uFF1A${f.path}`);
+      continue;
+    }
+    if (opts.twoWay) {
+      plan.push({
+        kind: "downloadConflict",
+        path: f.path,
+        fid: r.fid,
+        size: r.size,
+        updatedAt: r.updatedAt,
+        conflictPath: conflictPathFor(f.path, localPaths, remotePaths)
+      });
+      notes.push(`\u51B2\u7A81\uFF08\u53CC\u8FB9\u90FD\u6539\u52A8\uFF0C\u8FDC\u7AEF\u7248\u53E6\u5B58\uFF0C\u4E0D\u8986\u76D6\u4EFB\u4F55\u4E00\u8FB9\uFF09\uFF1A${f.path}`);
+      continue;
+    }
+    if (s.size !== r.size) {
       notes.push(`\u51B2\u7A81\uFF08\u672C\u5730\u4E3A\u51C6\uFF0C\u91CD\u65B0\u4E0A\u4F20\uFF09\uFF1A${f.path} \u8FDC\u7AEF size=${r.size} \u4E0A\u6B21 size=${s.size} \u672C\u5730 size=${f.size}`);
     }
     plan.push({ kind: "reupload", path: f.path, oldFid: r.fid });
@@ -945,16 +1068,44 @@ function computeDiff(local, remote, last, mirrorDelete) {
     if (consumedGone.has(r.path)) continue;
     const s = lastByPath.get(r.path);
     if (s) {
-      if (mirrorDelete) {
+      if (opts.mirrorDelete) {
         plan.push({ kind: "deleteRemote", path: r.path, fid: r.fid });
+      } else if (opts.twoWay) {
+        localDel.add(r.path);
+        notes.push(`\u672C\u5730\u5DF2\u5220\uFF0C\u8FDC\u7AEF\u4FDD\u7559\uFF0C\u4E0D\u4E0B\u8F7D\uFF1A${r.path}`);
       } else {
         notes.push(`\u672C\u5730\u5DF2\u5220\uFF0C\u8FDC\u7AEF\u4FDD\u7559\uFF08\u955C\u50CF\u5220\u9664\u672A\u5F00\uFF09\uFF1A${r.path}`);
       }
     } else {
-      notes.push(`\u8FDC\u7AEF\u6709\u3001\u672C\u5730\u65E0\uFF0C\u5DF2\u5FFD\u7565\uFF08\u5355\u5411\u540C\u6B65\u4E0D\u56DE\u5199\uFF09\uFF1A${r.path}`);
+      if (opts.twoWay) {
+        if (localDel.has(r.path)) {
+          notes.push(`\u672C\u5730\u5DF2\u5220\uFF0C\u8FDC\u7AEF\u4FDD\u7559\uFF0C\u4E0D\u4E0B\u8F7D\uFF1A${r.path}`);
+        } else {
+          plan.push({ kind: "download", path: r.path, fid: r.fid, size: r.size, updatedAt: r.updatedAt });
+        }
+      } else {
+        notes.push(`\u8FDC\u7AEF\u6709\u3001\u672C\u5730\u65E0\uFF0C\u5DF2\u5FFD\u7565\uFF08\u5355\u5411\u540C\u6B65\u4E0D\u56DE\u5199\uFF09\uFF1A${r.path}`);
+      }
     }
   }
-  return { plan, skipped, notes, adopted };
+  if (opts.twoWay) {
+    for (const s of last) {
+      if (!localByPath.has(s.path) && !remoteByPath.has(s.path)) {
+        dropState.push(s.path);
+        localDel.delete(s.path);
+        remoteDel.delete(s.path);
+      }
+    }
+  }
+  return {
+    plan,
+    skipped,
+    notes,
+    adopted,
+    refreshed,
+    dropState,
+    tombstones: { localDeleted: [...localDel], remoteDeleted: [...remoteDel] }
+  };
 }
 
 // src/sync.ts
@@ -981,6 +1132,9 @@ async function runSync(client, localFiles, lastState, options, log, onProgress, 
     renamed: 0,
     moved: 0,
     deletedRemote: 0,
+    deletedLocal: 0,
+    downloaded: 0,
+    conflictCopies: 0,
     skipped: 0,
     adopted: 0,
     failed: [],
@@ -1003,7 +1157,11 @@ async function runSync(client, localFiles, lastState, options, log, onProgress, 
   const targetFid = await client.ensureFolderPath(options.targetSegments, "0");
   log.info(`\u76EE\u6807\u6587\u4EF6\u5939 fid \u5DF2\u89E3\u6790\uFF0C\u8DEF\u5F84\uFF1A${options.targetSegments.join("/") || "(\u6839)"}`);
   const remote = await client.listRecursive(targetFid);
-  const { plan, skipped, notes, adopted } = computeDiff(usable, remote, lastState, options.mirrorDelete);
+  const { plan, skipped, notes, adopted, refreshed, dropState, tombstones: newTombstones } = computeDiff(usable, remote, lastState, {
+    mirrorDelete: options.mirrorDelete,
+    twoWay: options.twoWay,
+    tombstones: options.tombstones
+  });
   await onDiffed?.({ skipped: skipped.length, filtered: localFiles.length - usable.length, adopted: adopted.length });
   summary.skipped = skipped.length;
   summary.adopted = adopted.length;
@@ -1012,6 +1170,8 @@ async function runSync(client, localFiles, lastState, options, log, onProgress, 
   const localByPath = new Map(usable.map((f) => [f.path, f]));
   const newStateByPath = new Map(lastState.map((s) => [s.path, s]));
   for (const a of adopted) newStateByPath.set(a.path, a);
+  for (const r of refreshed) newStateByPath.set(r.path, r);
+  for (const d of dropState) newStateByPath.delete(d);
   for (const p of skipped) {
     void p;
   }
@@ -1035,7 +1195,7 @@ async function runSync(client, localFiles, lastState, options, log, onProgress, 
     return null;
   }
   const ordered = [...plan].sort((a, b) => {
-    const rank = (k) => k === "rename" || k === "move" ? 0 : k === "upload" || k === "reupload" ? 1 : 2;
+    const rank = (k) => k === "rename" || k === "move" ? 0 : k === "upload" || k === "reupload" || k === "download" || k === "downloadConflict" ? 1 : 2;
     return rank(a.kind) - rank(b.kind);
   });
   let done = 0;
@@ -1102,12 +1262,93 @@ async function runSync(client, localFiles, lastState, options, log, onProgress, 
         else summary.reuploaded++;
         log.info(`${action.kind === "upload" ? "\u4E0A\u4F20\u6210\u529F" : "\u91CD\u65B0\u4E0A\u4F20\u6210\u529F"}\uFF1A${action.path} size=${f.size}`);
         await onProgress?.(done, total, action.path, action.kind);
+      } else if (action.kind === "download" || action.kind === "downloadConflict") {
+        const isConflict = action.kind === "downloadConflict";
+        if (isIgnored(action.path, options.extraIgnores ?? [])) {
+          log.warn(`\u8FDC\u7AEF\u6587\u4EF6\u547D\u4E2D\u5FFD\u7565\u89C4\u5219\uFF0C\u672A\u4E0B\u8F7D\uFF1A${action.path}`);
+          summary.notes.push(`\u8FDC\u7AEF\u6587\u4EF6\u547D\u4E2D\u5FFD\u7565\u89C4\u5219\uFF0C\u672A\u4E0B\u8F7D\uFF1A${action.path}`);
+          await onProgress?.(done, total, action.path, action.kind);
+          continue;
+        }
+        if (action.size > options.maxFileBytes) {
+          log.warn(`\u8DF3\u8FC7\u8D85\u9650\u8FDC\u7AEF\u6587\u4EF6\uFF08>${options.maxFileBytes} \u5B57\u8282\uFF09\uFF1A${action.path} size=${action.size}`);
+          summary.notes.push(`\u8DF3\u8FC7\u8D85\u9650\u8FDC\u7AEF\u6587\u4EF6\uFF1A${action.path}`);
+          await onProgress?.(done, total, action.path, action.kind);
+          continue;
+        }
+        if (!options.writeLocal) throw new Error(`\u672A\u63D0\u4F9B\u672C\u5730\u5199\u5165\u56DE\u8C03\uFF0C\u65E0\u6CD5\u4E0B\u8F7D\uFF1A${action.path}`);
+        const bytes = await client.downloadBytes(action.fid);
+        const sha = await sha256Hex(bytes);
+        if (isConflict) {
+          const f = localByPath.get(action.path);
+          if (sha === f.sha256) {
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: f.size,
+              mtimeMs: f.mtimeMs,
+              sha256: f.sha256,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...action.updatedAt !== void 0 ? { remoteUpdatedAt: action.updatedAt } : {}
+            });
+            log.info(`\u51B2\u7A81\u5DF2\u81EA\u884C\u4E00\u81F4\uFF0C\u65E0\u9700\u53E6\u5B58\uFF1A${action.path}`);
+          } else {
+            await options.writeLocal(action.conflictPath, bytes);
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: f.size,
+              mtimeMs: f.mtimeMs,
+              sha256: f.sha256,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...action.updatedAt !== void 0 ? { remoteUpdatedAt: action.updatedAt } : {}
+            });
+            summary.conflictCopies++;
+            log.info(`\u51B2\u7A81\uFF1A\u8FDC\u7AEF\u7248\u5DF2\u53E6\u5B58\u4E3A ${action.conflictPath}\uFF0C\u672C\u5730\u539F\u6587\u4EF6\u672A\u52A8\uFF1A${action.path}`);
+          }
+          await onProgress?.(done, total, action.path, action.kind);
+        } else {
+          const existing = localByPath.get(action.path);
+          if (existing && existing.sha256 === sha) {
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: existing.size,
+              mtimeMs: existing.mtimeMs,
+              sha256: existing.sha256,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...action.updatedAt !== void 0 ? { remoteUpdatedAt: action.updatedAt } : {}
+            });
+            log.info(`\u8FDC\u7AEF\u5185\u5BB9\u4E0E\u672C\u5730\u4E00\u81F4\uFF0C\u65E0\u9700\u5199\u5165\uFF1A${action.path}`);
+          } else {
+            await options.writeLocal(action.path, bytes);
+            newStateByPath.set(action.path, {
+              path: action.path,
+              size: bytes.length,
+              mtimeMs: Date.now(),
+              sha256: sha,
+              fid: action.fid,
+              remoteSize: bytes.length,
+              ...action.updatedAt !== void 0 ? { remoteUpdatedAt: action.updatedAt } : {}
+            });
+            summary.downloaded++;
+            log.info(`\u4E0B\u8F7D\u6210\u529F\uFF1A${action.path} size=${bytes.length}`);
+          }
+          await onProgress?.(done, total, action.path, action.kind);
+        }
       } else if (action.kind === "deleteRemote") {
         await client.deleteFiles([action.fid]);
         newStateByPath.delete(action.path);
         summary.deletedRemote++;
         log.info(`\u5220\u9664\u8FDC\u7AEF\uFF1A${action.path}`);
         await onProgress?.(done, total, action.path, "deleteRemote");
+      } else if (action.kind === "deleteLocal") {
+        if (!options.deleteLocal) throw new Error(`\u672A\u63D0\u4F9B\u672C\u5730\u5220\u9664\u56DE\u8C03\uFF0C\u65E0\u6CD5\u5220\u9664\u672C\u5730\u6587\u4EF6\uFF1A${action.path}`);
+        await options.deleteLocal(action.path);
+        newStateByPath.delete(action.path);
+        summary.deletedLocal++;
+        log.info(`\u5220\u9664\u672C\u5730\uFF1A${action.path}`);
+        await onProgress?.(done, total, action.path, "deleteLocal");
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1117,7 +1358,7 @@ async function runSync(client, localFiles, lastState, options, log, onProgress, 
       await onProgress?.(done, total, path, "kind" in action ? action.kind : "");
     }
   }
-  return { summary, newState: [...newStateByPath.values()], cancelled };
+  return { summary, newState: [...newStateByPath.values()], tombstones: newTombstones, cancelled };
 }
 
 // src/settings.ts
@@ -1126,6 +1367,7 @@ var DEFAULT_SETTINGS = {
   cookie: "",
   targetFolder: "Obsidian\u5907\u4EFD",
   mirrorDelete: false,
+  twoWay: true,
   autoSyncMinutes: 0,
   maxFileBytes: 50 * 1024 * 1024,
   ignorePatterns: ""
@@ -1160,7 +1402,7 @@ var QuarkSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
     this.lastSyncEl = null;
     this.syncBtn = null;
     containerEl.empty();
-    containerEl.createEl("h2", { text: `\u5938\u514B\u540C\u6B65\uFF08\u5355\u5411\u5907\u4EFD\uFF09 v${this.plugin.manifest.version}` });
+    containerEl.createEl("h2", { text: `\u5938\u514B\u540C\u6B65 v${this.plugin.manifest.version}` });
     const ver = new import_obsidian2.Setting(containerEl).setName(`\u5F53\u524D\u7248\u672C v${this.plugin.manifest.version}`);
     const mark = ver.nameEl.createEl("span", { text: "!" });
     mark.style.verticalAlign = "super";
@@ -1171,7 +1413,7 @@ var QuarkSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
     mark.style.marginLeft = "4px";
     mark.title = "\u70B9\u51FB\u67E5\u770B\u66F4\u65B0\u8BF4\u660E";
     ver.setDesc(
-      "\u66F4\u65B0\uFF1A\u53EA\u8986\u76D6 main.js \u4E0E manifest.json\uFF0C\u5F7B\u5E95\u9000\u51FA Obsidian\uFF08Cmd+Q\uFF09\u518D\u91CD\u5F00\uFF1B\u4E0D\u8981\u5220\u9664\u6574\u4E2A\u63D2\u4EF6\u6587\u4EF6\u5939\uFF0C\u767B\u5F55\u4FE1\u606F\u4E0E\u540C\u6B65\u72B6\u6001\u5B58\u5728\u91CC\u9762\u7684 data.json\uFF0C\u5220\u4E86\u5C31\u4E22\u4E86\u3002\u672C\u5730\u4E3A\u51C6\uFF0C\u5938\u514B\u53EA\u5199\u4E0D\u56DE\u5199\u3002\u5938\u514B\u4E0A\u7684\u6539\u52A8\u4E0D\u4F1A\u56DE\u5199\u5230\u672C\u5730\uFF0C\u4E5F\u4E0D\u4F1A\u5220\u9664\u672C\u5730\u6587\u4EF6\u3002Git \u540C\u6B65\u7EE7\u7EED\u7528\uFF0C\u8FD9\u4E2A\u63D2\u4EF6\u662F\u53E6\u4E00\u6761\u5907\u4EFD\u8DEF\u7EBF\u3002"
+      "\u66F4\u65B0\uFF1A\u53EA\u8986\u76D6 main.js \u4E0E manifest.json\uFF0C\u5F7B\u5E95\u9000\u51FA Obsidian\uFF08Cmd+Q\uFF09\u518D\u91CD\u5F00\uFF1B\u4E0D\u8981\u5220\u9664\u6574\u4E2A\u63D2\u4EF6\u6587\u4EF6\u5939\uFF0C\u767B\u5F55\u4FE1\u606F\u4E0E\u540C\u6B65\u72B6\u6001\u5B58\u5728\u91CC\u9762\u7684 data.json\uFF0C\u5220\u4E86\u5C31\u4E22\u4E86\u3002\u53CC\u5411\u540C\u6B65\uFF1A\u672C\u5730\u548C\u5938\u514B\u5BF9\u7B49\uFF0C\u8FDC\u7AEF\u65B0\u589E\u6216\u6539\u52A8\u4F1A\u4E0B\u8F7D\u5230\u672C\u5730\uFF1B\u53CC\u8FB9\u90FD\u6539\u52A8\u65F6\u4E0D\u8986\u76D6\uFF0C\u8FDC\u7AEF\u7248\u53E6\u5B58\u4E3A\u201C\uFF08\u5938\u514B\u51B2\u7A81\uFF09\u201D\u6587\u4EF6\uFF1B\u955C\u50CF\u5220\u9664\u5173\u65F6\u5220\u9664\u4E0D\u4E92\u76F8\u540C\u6B65\u3002Git \u540C\u6B65\u7EE7\u7EED\u7528\uFF0C\u8FD9\u4E2A\u63D2\u4EF6\u662F\u53E6\u4E00\u6761\u5907\u4EFD\u8DEF\u7EBF\u3002"
     );
     ver.descEl.style.display = "none";
     mark.onclick = () => {
@@ -1217,10 +1459,18 @@ var QuarkSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
       })
     );
     new import_obsidian2.Setting(containerEl).setName("\u955C\u50CF\u5220\u9664").setDesc(
-      "\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF09\uFF1A\u672C\u5730\u5220\u4E86\u6587\u4EF6\uFF0C\u8FDC\u7AEF\u4FDD\u7559\uFF0C\u53EA\u8BB0\u65E5\u5FD7\u3002\u6253\u5F00\uFF1A\u672C\u5730\u5220\u4E86\u4E14\u4E0A\u6B21\u540C\u6B65\u8FC7\u7684\u6587\u4EF6\uFF0C\u8FDC\u7AEF\u4E5F\u4F1A\u5220\u9664\u3002\u8BF7\u8C28\u614E\u6253\u5F00\u3002"
+      "\u5173\u95ED\uFF08\u9ED8\u8BA4\uFF09\uFF1A\u5220\u9664\u4E0D\u4E92\u76F8\u540C\u6B65\uFF1A\u672C\u5730\u5220\u4E86\u8FDC\u7AEF\u4FDD\u7559\uFF0C\u8FDC\u7AEF\u5220\u4E86\u672C\u5730\u4FDD\u7559\uFF0C\u4E14\u4E0D\u4F1A\u628A\u5220\u6389\u7684\u6587\u4EF6\u91CD\u65B0\u4E0B\u8F7D\u6216\u4E0A\u4F20\u56DE\u6765\u3002\u6253\u5F00\uFF1A\u5220\u9664\u53CC\u5411\u540C\u6B65\uFF1A\u672C\u5730\u5220\u4E86\u8FDC\u7AEF\u5220\uFF0C\u8FDC\u7AEF\u5220\u4E86\u672C\u5730\u6587\u4EF6\u8FDB Obsidian \u56DE\u6536\u7AD9\uFF08.trash\uFF0C\u53EF\u6062\u590D\uFF09\u3002"
     ).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.mirrorDelete).onChange(async (value) => {
         this.plugin.settings.mirrorDelete = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("\u53CC\u5411\u540C\u6B65").setDesc(
+      "\u6253\u5F00\uFF08\u9ED8\u8BA4\uFF09\uFF1A\u8FDC\u7AEF\u65B0\u589E\u6216\u6539\u52A8\u7684\u6587\u4EF6\u4F1A\u4E0B\u8F7D\u5230\u672C\u5730\uFF1B\u53CC\u8FB9\u90FD\u6539\u52A8\u65F6\u4E0D\u8986\u76D6\u4EFB\u4F55\u4E00\u8FB9\uFF0C\u8FDC\u7AEF\u7248\u53E6\u5B58\u4E3A\u201C\uFF08\u5938\u514B\u51B2\u7A81\uFF09\u201D\u6587\u4EF6\u5E76\u8BB0\u65E5\u5FD7\u3002\u5173\u95ED\uFF1A\u53EA\u4E0A\u4F20\uFF08\u65E7\u7684\u5355\u5411\u884C\u4E3A\uFF09\u3002"
+    ).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.twoWay).onChange(async (value) => {
+        this.plugin.settings.twoWay = value;
         await this.plugin.saveSettings();
       })
     );
@@ -1288,6 +1538,7 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
     this.lastState = [];
+    this.tombstones = { localDeleted: [], remoteDeleted: [] };
     this.lastSyncAt = null;
     this.log = new RingLog(200);
     this.running = false;
@@ -1313,6 +1564,7 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
     if (data) {
       this.settings = { ...DEFAULT_SETTINGS, ...data.settings ?? {} };
       this.lastState = data.lastState ?? [];
+      this.tombstones = data.tombstones ?? { localDeleted: [], remoteDeleted: [] };
       this.lastSyncAt = typeof data.lastSyncAt === "string" ? data.lastSyncAt : null;
       if (data.lastProgress) {
         this.progress = {
@@ -1377,6 +1629,7 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
     await this.saveData({
       settings: this.settings,
       lastState: this.lastState,
+      tombstones: this.tombstones,
       lastSyncAt: this.lastSyncAt,
       lastProgress: {
         total: this.progress.total,
@@ -1475,7 +1728,7 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
     }
     this.cancelRequested = false;
     if (!this.settings.cookie.trim()) {
-      if (!quiet) new import_obsidian3.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u9875\u7C98\u8D34\u5938\u514B Cookie \u6216\u7528\u4E8C\u7EF4\u7801\u767B\u5F55");
+      if (!quiet) new import_obsidian3.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u9875\u7C98\u8D34\u5938\u514B Cookie");
       return;
     }
     this.running = true;
@@ -1578,13 +1831,38 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
       this.progressBase = 0;
       this.progressFileDone = 0;
       this.notifyProgress();
-      const { summary, newState, cancelled } = await runSync(
+      const { summary, newState, tombstones: newTombstones, cancelled } = await runSync(
         client,
         localFiles,
         this.lastState,
         {
           targetSegments: targetSegments(this.settings),
           mirrorDelete: this.settings.mirrorDelete,
+          twoWay: this.settings.twoWay,
+          tombstones: this.tombstones,
+          extraIgnores,
+          writeLocal: async (path, data) => {
+            const dir = dirOf(path);
+            if (dir) {
+              const parts = dir.split("/");
+              let cur = "";
+              for (const seg of parts) {
+                cur = cur ? `${cur}/${seg}` : seg;
+                if (!this.app.vault.getAbstractFileByPath(cur)) await this.app.vault.createFolder(cur);
+              }
+            }
+            const buf = data.slice().buffer;
+            const existing = this.app.vault.getAbstractFileByPath(path);
+            if (existing && "stat" in existing) {
+              await this.app.vault.modifyBinary(existing, buf);
+            } else {
+              await this.app.vault.createBinary(path, buf);
+            }
+          },
+          deleteLocal: async (path) => {
+            const f = this.app.vault.getAbstractFileByPath(path);
+            if (f) await this.app.vault.trash(f, false);
+          },
           maxFileBytes: this.settings.maxFileBytes,
           shouldCancel: () => this.cancelRequested,
           onUploadPart: (path, part, totalParts) => {
@@ -1597,7 +1875,7 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
         async (done, total, current, kind) => {
           this.progressCurrent = current;
           this.setStatus(`\u5938\u514B\u540C\u6B65\uFF1A${done}/${total} \xB7 ${current}`);
-          if (kind !== "deleteRemote") {
+          if (kind !== "deleteRemote" && kind !== "deleteLocal") {
             this.progressFileDone++;
             this.progress.done = Math.min(this.progress.total, this.progressBase + this.progressFileDone);
             this.notifyProgressThrottled();
@@ -1616,6 +1894,7 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
       this.progress.failed = summary.failed.length;
       this.lastSyncAt = (/* @__PURE__ */ new Date()).toISOString();
       this.lastState = newState;
+      this.tombstones = newTombstones;
       this.syncCookieFrom(client);
       if (cancelled) {
         this.progress.paused = true;
@@ -1629,9 +1908,9 @@ var QuarkSyncPlugin = class extends import_obsidian3.Plugin {
         this.notifyProgress();
         await this.saveSettings();
         this.statusEl?.setText(
-          `\u5938\u514B\u540C\u6B65\u5B8C\u6210\uFF1A\u4E0A\u4F20 ${summary.uploaded + summary.reuploaded} \xB7 \u8DF3\u8FC7 ${summary.skipped} \xB7 \u5931\u8D25 ${summary.failed.length}`
+          `\u5938\u514B\u540C\u6B65\u5B8C\u6210\uFF1A\u4E0A\u4F20 ${summary.uploaded + summary.reuploaded} \xB7 \u4E0B\u8F7D ${summary.downloaded} \xB7 \u8DF3\u8FC7 ${summary.skipped} \xB7 \u5931\u8D25 ${summary.failed.length}`
         );
-        const msg = `\u5938\u514B\u540C\u6B65\u5B8C\u6210\uFF1A\u4E0A\u4F20 ${summary.uploaded}\u3001\u91CD\u65B0\u4E0A\u4F20 ${summary.reuploaded}\u3001\u6539\u540D ${summary.renamed}\u3001\u79FB\u52A8 ${summary.moved}\u3001\u8FDC\u7AEF\u5220\u9664 ${summary.deletedRemote}\u3001\u8DF3\u8FC7 ${summary.skipped}` + (summary.adopted > 0 ? `\u3001\u8BA4\u9886 ${summary.adopted}` : "") + `\u3001\u5931\u8D25 ${summary.failed.length}` + (summary.failed.length > 0 ? `\uFF0C\u9996\u4E2A\u5931\u8D25\uFF1A${summary.failed[0].path}\uFF1A${summary.failed[0].error}` : "");
+        const msg = `\u5938\u514B\u540C\u6B65\u5B8C\u6210\uFF1A\u4E0A\u4F20 ${summary.uploaded}\u3001\u91CD\u65B0\u4E0A\u4F20 ${summary.reuploaded}\u3001\u4E0B\u8F7D ${summary.downloaded}\u3001\u51B2\u7A81\u53E6\u5B58 ${summary.conflictCopies}\u3001\u6539\u540D ${summary.renamed}\u3001\u79FB\u52A8 ${summary.moved}\u3001\u8FDC\u7AEF\u5220\u9664 ${summary.deletedRemote}\u3001\u672C\u5730\u5220\u9664 ${summary.deletedLocal}\u3001\u8DF3\u8FC7 ${summary.skipped}` + (summary.adopted > 0 ? `\u3001\u8BA4\u9886 ${summary.adopted}` : "") + `\u3001\u5931\u8D25 ${summary.failed.length}` + (summary.failed.length > 0 ? `\uFF0C\u9996\u4E2A\u5931\u8D25\uFF1A${summary.failed[0].path}\uFF1A${summary.failed[0].error}` : "");
         if (!quiet || summary.failed.length > 0) new import_obsidian3.Notice(msg);
         this.log.info(msg);
       }

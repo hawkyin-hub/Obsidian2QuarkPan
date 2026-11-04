@@ -7,6 +7,7 @@ export interface QuarkSyncSettings {
   cookie: string;
   targetFolder: string;
   mirrorDelete: boolean;
+  twoWay: boolean;
   autoSyncMinutes: number;
   maxFileBytes: number;
   ignorePatterns: string; // one glob per line
@@ -16,6 +17,7 @@ export const DEFAULT_SETTINGS: QuarkSyncSettings = {
   cookie: "",
   targetFolder: "Obsidian备份",
   mirrorDelete: false,
+  twoWay: true,
   autoSyncMinutes: 0,
   maxFileBytes: 50 * 1024 * 1024,
   ignorePatterns: "",
@@ -65,7 +67,7 @@ export class QuarkSyncSettingTab extends PluginSettingTab {
     this.lastSyncEl = null;
     this.syncBtn = null;
     containerEl.empty();
-    containerEl.createEl("h2", { text: `夸克同步（单向备份） v${this.plugin.manifest.version}` });
+    containerEl.createEl("h2", { text: `夸克同步 v${this.plugin.manifest.version}` });
     // Release UI: the version row shows only the number plus a superscript
     // "!" marker; the update note and the one-way-backup orientation live in
     // the row's description, hidden until the marker is clicked.
@@ -79,7 +81,7 @@ export class QuarkSyncSettingTab extends PluginSettingTab {
     mark.style.marginLeft = "4px";
     mark.title = "点击查看更新说明";
     ver.setDesc(
-      "更新：只覆盖 main.js 与 manifest.json，彻底退出 Obsidian（Cmd+Q）再重开；不要删除整个插件文件夹，登录信息与同步状态存在里面的 data.json，删了就丢了。本地为准，夸克只写不回写。夸克上的改动不会回写到本地，也不会删除本地文件。Git 同步继续用，这个插件是另一条备份路线。",
+      "更新：只覆盖 main.js 与 manifest.json，彻底退出 Obsidian（Cmd+Q）再重开；不要删除整个插件文件夹，登录信息与同步状态存在里面的 data.json，删了就丢了。双向同步：本地和夸克对等，远端新增或改动会下载到本地；双边都改动时不覆盖，远端版另存为“（夸克冲突）”文件；镜像删除关时删除不互相同步。Git 同步继续用，这个插件是另一条备份路线。",
     );
     ver.descEl.style.display = "none";
     mark.onclick = () => {
@@ -147,11 +149,23 @@ export class QuarkSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("镜像删除")
       .setDesc(
-        "关闭（默认）：本地删了文件，远端保留，只记日志。打开：本地删了且上次同步过的文件，远端也会删除。请谨慎打开。",
+        "关闭（默认）：删除不互相同步：本地删了远端保留，远端删了本地保留，且不会把删掉的文件重新下载或上传回来。打开：删除双向同步：本地删了远端删，远端删了本地文件进 Obsidian 回收站（.trash，可恢复）。",
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.mirrorDelete).onChange(async (value) => {
           this.plugin.settings.mirrorDelete = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("双向同步")
+      .setDesc(
+        "打开（默认）：远端新增或改动的文件会下载到本地；双边都改动时不覆盖任何一边，远端版另存为“（夸克冲突）”文件并记日志。关闭：只上传（旧的单向行为）。",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.twoWay).onChange(async (value) => {
+          this.plugin.settings.twoWay = value;
           await this.plugin.saveSettings();
         }),
       );

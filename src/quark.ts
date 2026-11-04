@@ -35,6 +35,7 @@ export interface RemoteEntry {
   path: string;
   fid: string;
   size: number;
+  updatedAt?: number;
 }
 
 export type FetchFn = typeof fetch;
@@ -241,7 +242,7 @@ export class QuarkClient {
         if (it.file_type === 0) {
           queue.push({ fid: it.fid, prefix: path });
         } else {
-          out.push({ path, fid: it.fid, size: it.size });
+          out.push({ path, fid: it.fid, size: it.size, updatedAt: it.updated_at });
         }
       }
     }
