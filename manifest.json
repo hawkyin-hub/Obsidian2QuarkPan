@@ -1,0 +1,10 @@
+{
+  "author": "hawk",
+  "authorUrl": "",
+  "description": "单向备份式同步：把 Obsidian 笔记库同步到夸克网盘指定文件夹。本地为准，不回写。",
+  "id": "obsidian-quark-sync",
+  "isDesktopOnly": false,
+  "minAppVersion": "0.15.0",
+  "name": "Quark Sync",
+  "version": "0.1.22"
+}

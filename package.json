@@ -1,0 +1,23 @@
+{
+  "name": "obsidian-quark-sync",
+  "version": "0.1.22",
+  "description": "Obsidian plugin: one-way backup of a vault to Quark Pan",
+  "main": "index.js",
+  "scripts": {
+    "build": "node esbuild.mjs production",
+    "dev": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/diff.test.ts tests/hash.test.ts tests/ignore.test.ts tests/sha1state.test.ts tests/sanitize.test.ts tests/log.test.ts",
+    "e2e": "node tests/e2e-obsidian-flow.mjs"
+  },
+  "keywords": [],
+  "author": "hawk",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.14.4",
+    "typescript": "^7.0.2",
+    "undici": "^8.12.3"
+  }
+}
