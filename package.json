@@ -1,7 +1,7 @@
 {
   "name": "obsidian-quark-sync",
-  "version": "0.2.0",
-  "description": "Obsidian plugin: two-way sync of a vault with Quark Pan",
+  "version": "0.2.1",
+  "description": "",
   "main": "index.js",
   "directories": {
     "doc": "docs",
@@ -11,12 +11,12 @@
     "build": "node esbuild.mjs production",
     "dev": "node esbuild.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/diff.test.ts tests/hash.test.ts tests/ignore.test.ts tests/sha1state.test.ts tests/sanitize.test.ts tests/log.test.ts",
+    "test": "node --test tests/diff.test.ts tests/hash.test.ts tests/ignore.test.ts tests/sha1state.test.ts tests/sanitize.test.ts tests/log.test.ts tests/quark-download.test.ts",
     "e2e": "node tests/e2e-obsidian-flow.mjs"
   },
   "keywords": [],
-  "author": "hawk",
-  "license": "MIT",
+  "author": "",
+  "license": "ISC",
   "devDependencies": {
     "@types/node": "^26.6.6",
     "esbuild": "^0.28.2",

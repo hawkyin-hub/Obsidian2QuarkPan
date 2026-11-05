@@ -543,36 +543,63 @@ var QuarkClient = class {
     }
     throw new QuarkError("\u79FB\u52A8\u4EFB\u52A1\u8D85\u65F6\uFF0815 \u79D2\u672A\u5B8C\u6210\uFF09");
   }
-  async downloadBytes(fid) {
-    const json = await this.request(
-      "POST",
-      "file/download",
-      { fids: [fid] },
-      { pr: "ucpro", fr: "pc", sys: "win32", ve: "2.5.56", ut: "", guid: "" }
-    );
-    const list = json["data"] ?? [];
-    const url = String(list[0]?.["download_url"] ?? "");
-    if (!url) throw new QuarkError("\u65E0\u6CD5\u83B7\u53D6\u4E0B\u8F7D\u94FE\u63A5");
-    const res = await this.fetchFn(url, {
-      headers: {
-        Accept: "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-        origin: "https://pan.quark.cn",
-        referer: "https://pan.quark.cn/",
-        "Sec-Ch-Ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
-        "Sec-Ch-Ua-Mobile": "?1",
-        "Sec-Ch-Ua-Platform": '"Android"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-        ...this.cookie.trim() ? { cookie: this.cookie } : {}
+  // Download with retry. The CDN GET is the flaky leg: Quark's download
+  // CDN intermittently answers 403 during bulk downloads (same signature
+  // as the October 2026 wind-control incidents on this account: link
+  // issuance succeeds, the CDN GET is refused, and the same files download
+  // fine minutes later). The link is re-issued on every attempt, and only
+  // the CDN leg retries — an auth failure from file/download itself means
+  // the session is dead and must surface immediately, never be retried.
+  // retryDelays is injectable so unit tests can pass [0, 0].
+  async downloadBytes(fid, retryDelays = [5e3, 2e4]) {
+    const maxAttempts = retryDelays.length + 1;
+    let lastStatus = 0;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const json = await this.request(
+        "POST",
+        "file/download",
+        { fids: [fid] },
+        { pr: "ucpro", fr: "pc", sys: "win32", ve: "2.5.56", ut: "", guid: "" }
+      );
+      const list = json["data"] ?? [];
+      const url = String(list[0]?.["download_url"] ?? "");
+      if (!url) throw new QuarkError("\u65E0\u6CD5\u83B7\u53D6\u4E0B\u8F7D\u94FE\u63A5");
+      let res;
+      try {
+        res = await this.fetchFn(url, {
+          headers: {
+            Accept: "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Cache-Control": "no-cache",
+            Pragma: "no-cache",
+            origin: "https://pan.quark.cn",
+            referer: "https://pan.quark.cn/",
+            "Sec-Ch-Ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+            "Sec-Ch-Ua-Mobile": "?1",
+            "Sec-Ch-Ua-Platform": '"Android"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+            ...this.cookie.trim() ? { cookie: this.cookie } : {}
+          }
+        });
+      } catch (e) {
+        if (attempt === maxAttempts) {
+          throw new QuarkError(
+            `\u4E0B\u8F7D\u5931\u8D25\uFF08\u7F51\u7EDC\u9519\u8BEF\uFF0C\u5DF2\u91CD\u8BD5 ${maxAttempts} \u6B21\uFF09\uFF1A${e instanceof Error ? e.message : String(e)}`
+          );
+        }
+        await sleep(retryDelays[attempt - 1]);
+        continue;
       }
-    });
-    if (!res.ok) throw new QuarkError(`\u4E0B\u8F7D\u5931\u8D25\uFF08HTTP ${res.status}\uFF09`);
-    return new Uint8Array(await res.arrayBuffer());
+      if (res.ok) return new Uint8Array(await res.arrayBuffer());
+      lastStatus = res.status;
+      const retryable = res.status === 403 || res.status === 429 || res.status >= 500;
+      if (!retryable || attempt === maxAttempts) break;
+      await sleep(retryDelays[attempt - 1]);
+    }
+    throw new QuarkError(`\u4E0B\u8F7D\u5931\u8D25\uFF08HTTP ${lastStatus}\uFF0C\u5DF2\u91CD\u8BD5 ${maxAttempts} \u6B21\uFF09`);
   }
   // ---- Upload: pre -> update hash -> OSS parts -> complete -> finish ----
   mimeFor(name) {

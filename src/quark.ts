@@ -327,37 +327,65 @@ export class QuarkClient {
     throw new QuarkError("移动任务超时（15 秒未完成）");
   }
 
-  async downloadBytes(fid: string): Promise<Uint8Array> {
-    const json = await this.request(
-      "POST",
-      "file/download",
-      { fids: [fid] },
-      { pr: "ucpro", fr: "pc", sys: "win32", ve: "2.5.56", ut: "", guid: "" },
-    );
-    const list = (json["data"] as Record<string, unknown>[]) ?? [];
-    const url = String(list[0]?.["download_url"] ?? "");
-    if (!url) throw new QuarkError("无法获取下载链接");
-    const res = await this.fetchFn(url, {
-      headers: {
-        Accept: "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-        origin: "https://pan.quark.cn",
-        referer: "https://pan.quark.cn/",
-        "Sec-Ch-Ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
-        "Sec-Ch-Ua-Mobile": "?1",
-        "Sec-Ch-Ua-Platform": '"Android"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-        ...(this.cookie.trim() ? { cookie: this.cookie } : {}),
-      },
-    });
-    if (!res.ok) throw new QuarkError(`下载失败（HTTP ${res.status}）`);
-    return new Uint8Array(await res.arrayBuffer());
+  // Download with retry. The CDN GET is the flaky leg: Quark's download
+  // CDN intermittently answers 403 during bulk downloads (same signature
+  // as the October 2026 wind-control incidents on this account: link
+  // issuance succeeds, the CDN GET is refused, and the same files download
+  // fine minutes later). The link is re-issued on every attempt, and only
+  // the CDN leg retries — an auth failure from file/download itself means
+  // the session is dead and must surface immediately, never be retried.
+  // retryDelays is injectable so unit tests can pass [0, 0].
+  async downloadBytes(fid: string, retryDelays: number[] = [5000, 20000]): Promise<Uint8Array> {
+    const maxAttempts = retryDelays.length + 1;
+    let lastStatus = 0;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const json = await this.request(
+        "POST",
+        "file/download",
+        { fids: [fid] },
+        { pr: "ucpro", fr: "pc", sys: "win32", ve: "2.5.56", ut: "", guid: "" },
+      );
+      const list = (json["data"] as Record<string, unknown>[]) ?? [];
+      const url = String(list[0]?.["download_url"] ?? "");
+      if (!url) throw new QuarkError("无法获取下载链接");
+      let res: Awaited<ReturnType<FetchFn>>;
+      try {
+        res = await this.fetchFn(url, {
+          headers: {
+            Accept: "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Cache-Control": "no-cache",
+            Pragma: "no-cache",
+            origin: "https://pan.quark.cn",
+            referer: "https://pan.quark.cn/",
+            "Sec-Ch-Ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+            "Sec-Ch-Ua-Mobile": "?1",
+            "Sec-Ch-Ua-Platform": '"Android"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "User-Agent":
+              "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+            ...(this.cookie.trim() ? { cookie: this.cookie } : {}),
+          },
+        });
+      } catch (e) {
+        // Network-level failure: retryable, same as a 5xx.
+        if (attempt === maxAttempts) {
+          throw new QuarkError(
+            `下载失败（网络错误，已重试 ${maxAttempts} 次）：${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+        await sleep(retryDelays[attempt - 1]);
+        continue;
+      }
+      if (res.ok) return new Uint8Array(await res.arrayBuffer());
+      lastStatus = res.status;
+      const retryable = res.status === 403 || res.status === 429 || res.status >= 500;
+      if (!retryable || attempt === maxAttempts) break;
+      await sleep(retryDelays[attempt - 1]);
+    }
+    throw new QuarkError(`下载失败（HTTP ${lastStatus}，已重试 ${maxAttempts} 次）`);
   }
 
   // ---- Upload: pre -> update hash -> OSS parts -> complete -> finish ----
